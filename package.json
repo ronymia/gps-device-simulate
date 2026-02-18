@@ -1,0 +1,11 @@
+{
+  "name": "gps-simulator",
+  "version": "1.0.0",
+  "description": "JT/T 808 GPS Device Simulator - Simulates 20 virtual GPS tracking devices",
+  "main": "simulator.js",
+  "scripts": {
+    "start": "node simulator.js"
+  },
+  "keywords": ["gps", "simulator", "jt808"],
+  "license": "ISC"
+}

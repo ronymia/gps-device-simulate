@@ -1,0 +1,411 @@
+Here is the complete package. I have separated it into an *Explanation* section so you understand what is happening, and a *Setup Guide* with the full code ready to copy-paste.
+
+---
+
+### 📝 PART 1: Explanation of the Simulator
+
+*What is this?*
+This is a software tool that acts like 20 physical GPS devices installed in cars. It allows you to test your backend server, database, and frontend map without needing real hardware or real cars.
+
+*How does it work?*
+1.  *Protocol Simulation:* It implements the *JT/T 808 Protocol*. It opens a TCP connection to your server and performs the handshake:
+    *   Connects to IP 54.37.225.166 on Port 3017.
+    *   Sends a *Registration Packet* (simulating a new device turning on).
+    *   Receives an Auth Code.
+    *   Sends an *Authentication Packet* (logging in).
+    *   Starts sending *Location Packets (0x0200)* every 2 seconds.
+2.  *Realistic Movement Physics:*
+    *   *Unique Identity:* Each device gets a unique 15-digit IMEI (e.g., 868120000000001) and Plate Number (SIM-0001).
+    *   *Random Speed:* Each "car" picks a random speed (e.g., one drives 20km/h, another 55km/h) and maintains it.
+    *   *Random Directions:* Instead of all moving in one line, each car picks a random compass direction (North, South, East, West) and moves that way.
+    *   *Road Wiggle:* The code adds slight random turns to the steering, so the cars don't drive in perfectly straight lines; they look like they are following roads.
+3.  *Command Line Control:*
+    *   You can type start all to launch 20 devices instantly.
+    *   You can type status to see which cars are driving and their current speeds.
+    *   You can type stop 5 to park a specific car.
+
+---
+
+### 🛠️ PART 2: Setup Instructions
+
+*Step 1: Install Node.js*
+If you don't have Node.js installed, download it from [nodejs.org](https://nodejs.org/) and install it.
+
+*Step 2: Create the Project*
+1.  Create a new folder on your computer named simulator.
+2.  Open that folder in your code editor (VS Code, Notepad++, etc.).
+3.  Inside this folder, create a file named simulator.js.
+
+*Step 3: Paste the Code*
+Copy the full code block below and paste it into simulator.js.
+
+*Step 4: Run it*
+Open your terminal/command prompt in that folder and run:
+bash
+node simulator.js
+
+
+---
+
+### 💻 PART 3: Full Code (simulator.js)
+
+javascript
+const net = require('net');
+const readline = require('readline');
+
+// ==========================================
+// CONFIGURATION
+// ==========================================
+
+const CONFIG = {
+    // 1. SERVER DETAILS (Already set to your requested IP/Port)
+    HOST: '54.37.225.166', 
+    PORT: 3017,            
+    
+    // 2. SIMULATION SETTINGS
+    NUM_DEVICES: 20,       // Total number of virtual cars
+    CENTER_LAT: 51.5074,   // Start Location: London, UK
+    CENTER_LNG: -0.1278,
+    SPREAD: 0.1,           // How far cars spawn from center (~10km radius)
+    
+    // 3. TIMING
+    GPS_INTERVAL_MS: 2000  // Send GPS every 2 seconds
+};
+
+// ==========================================
+// PROTOCOL CONSTANTS (JT/T 808)
+// ==========================================
+const MSG_ID = {
+    REGISTER: 0x0100,
+    AUTH: 0x0102,
+    HEARTBEAT: 0x0002,
+    LOCATION: 0x0200
+};
+
+// ==========================================
+// UTILITY FUNCTIONS
+// ==========================================
+
+// Convert number to BCD Buffer (for IMEI and Time)
+function intToBcd(num, len) {
+    const bcd = Buffer.alloc(len);
+    const str = num.toString().padStart(len * 2, '0');
+    for (let i = 0; i < len; i++) {
+        bcd[i] = parseInt(str.substr(i * 2, 2), 16);
+    }
+    return bcd;
+}
+
+// Calculate XOR Checksum
+function calculateChecksum(buf) {
+    let cs = 0;
+    for (let i = 0; i < buf.length; i++) cs ^= buf[i];
+    return cs;
+}
+
+// Escape reserved bytes (0x7E, 0x7D)
+function escapeBuffer(buf) {
+    let escaped = [];
+    for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0x7E) escaped.push(0x7D, 0x02);
+        else if (buf[i] === 0x7D) escaped.push(0x7D, 0x01);
+        else escaped.push(buf[i]);
+    }
+    return Buffer.from(escaped);
+}
+
+// Unescape incoming data
+function unescapeBuffer(buf) {
+    let unescaped = [];
+    for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0x7D) {
+            i++; 
+            if (buf[i] === 0x02) unescaped.push(0x7E);
+            else if (buf[i] === 0x01) unescaped.push(0x7D);
+        } else {
+            unescaped.push(buf[i]);
+        }
+    }
+    return Buffer.from(unescaped);
+}
+
+// Generate a 15-digit IMEI based on index
+function generateIMEI(index) {
+    return `868120${String(index).padStart(9, '0')}`;
+}
+
+// ==========================================
+// VIRTUAL DEVICE CLASS
+// ==========================================
+class VirtualDevice {
+    constructor(index) {
+        this.index = index;
+        
+        // Identity
+        this.imei = generateIMEI(index); 
+        this.plateNumber = `SIM-${index.toString().padStart(4, '0')}`;
+        
+        // State
+        this.serialNo = 1;
+        this.authCode = '';
+        this.socket = null;
+        this.intervals = [];
+        this.status = 'OFFLINE';
+        
+        // Movement
+        // Random spawn within SPREAD degrees of center
+        this.lat = CONFIG.CENTER_LAT + ((Math.random() - 0.5) * 2 * CONFIG.SPREAD);
+        this.lng = CONFIG.CENTER_LNG + ((Math.random() - 0.5) * 2 * CONFIG.SPREAD);
+        
+        // Random speed: between 10 and 70 km/h
+        this.speed = Math.floor(Math.random() * 60) + 10;
+        
+        // Random direction: 0-360 degrees
+        this.direction = Math.floor(Math.random() * 360);
+    }
+
+    connect() {
+        if (this.socket) this.disconnect();
+
+        this.socket = new net.Socket();
+        this.status = 'CONNECTING';
+        
+        this.socket.on('data', (data) => this.handleData(data));
+        this.socket.on('close', () => { 
+            this.status = 'OFFLINE'; 
+            this.clearIntervals();
+        });
+        this.socket.on('error', (err) => { 
+            this.status = 'ERROR'; 
+            this.clearIntervals();
+        });
+
+        this.socket.connect(CONFIG.PORT, CONFIG.HOST, () => {
+            this.status = 'CONNECTED';
+            console.log(`[Device ${this.index}] Connected to ${CONFIG.HOST}. Registering...`);
+            this.sendRegister();
+        });
+    }
+
+    disconnect() {
+        this.clearIntervals();
+        if (this.socket) {
+            this.socket.destroy();
+            this.socket = null;
+        }
+        this.status = 'OFFLINE';
+        console.log(`[Device ${this.index}] Stopped.`);
+    }
+
+    clearIntervals() {
+        this.intervals.forEach(clearInterval);
+        this.intervals = [];
+    }
+
+    // Build a valid JT/T 808 Packet
+    buildPacket(msgId, body) {
+        const phone = intToBcd(this.imei, 6);
+        const serial = Buffer.alloc(2); 
+        serial.writeUInt16BE(this.serialNo++);
+        
+        const msgProps = Buffer.alloc(2);
+        msgProps.writeUInt16BE(body.length);
+        
+        const header = Buffer.concat([
+            Buffer.from([msgId >> 8, msgId & 0xff]), 
+            msgProps, 
+            phone, 
+            serial
+        ]);
+        
+        const content = Buffer.concat([header, body]);
+        const checksum = Buffer.from([calculateChecksum(content)]);
+        const rawPacket = Buffer.concat([Buffer.from([0x7E]), content, checksum, Buffer.from([0x7E])]);
+        
+        return escapeBuffer(rawPacket);
+    }
+
+    sendPacket(msgId, body) {
+        if (!this.socket || this.socket.destroyed) return;
+        const packet = this.buildPacket(msgId, body);
+        this.socket.write(packet);
+    }
+
+    sendRegister() {
+        const body = Buffer.concat([
+            Buffer.from([0x00, 0x00]),        // Province ID
+            Buffer.from([0x00, 0x00]),        // City ID
+            Buffer.from('SIMULATOR'),         // Manufacturer
+            Buffer.from('MODEL01'),           // Model
+            intToBcd(this.imei, 6),           // IMEI BCD
+            Buffer.from([0x01]),              // Plate Color (Blue)
+            Buffer.from(this.plateNumber)     // Plate String
+        ]);
+        this.sendPacket(MSG_ID.REGISTER, body);
+    }
+
+    sendAuth() {
+        const body = Buffer.from(this.authCode);
+        this.sendPacket(MSG_ID.AUTH, body);
+    }
+
+    startStreaming() {
+        console.log(`[Device ${this.index}] ✅ Authenticated! Driving at ${this.speed}km/h heading ${Math.round(this.direction)}°`);
+        
+        // Heartbeat
+        this.intervals.push(setInterval(() => {
+            this.sendPacket(MSG_ID.HEARTBEAT, Buffer.alloc(0));
+        }, 30000));
+
+        // GPS Loop
+        this.intervals.push(setInterval(() => {
+            this.updatePosition();
+            this.sendLocation();
+        }, CONFIG.GPS_INTERVAL_MS));
+    }
+
+    updatePosition() {
+        // Add slight random turn to simulate road driving
+        this.direction += (Math.random() * 6) - 3; 
+        if(this.direction < 0) this.direction += 360;
+        if(this.direction > 360) this.direction -= 360;
+
+        // Calculate movement based on speed
+        // Speed is km/h. 
+        // Time step is CONFIG.GPS_INTERVAL_MS.
+        const kmPerMs = this.speed / 3600000; 
+        const distKm = kmPerMs * CONFIG.GPS_INTERVAL_MS;
+        const distDeg = distKm / 111.0; // 1 deg approx 111km
+
+        const rad = this.direction * Math.PI / 180;
+        
+        this.lat += Math.cos(rad) * distDeg;
+        this.lng += Math.sin(rad) * distDeg;
+    }
+
+    sendLocation() {
+        const alarm = Buffer.alloc(4);
+        const status = Buffer.alloc(4); status.writeUInt32BE(0x00000001); // ACC ON
+        
+        const lat = Buffer.alloc(4); lat.writeInt32BE(Math.round(this.lat * 1000000));
+        const lng = Buffer.alloc(4); lng.writeInt32BE(Math.round(this.lng * 1000000));
+        
+        const altitude = Buffer.from([0x00, 0x32]); 
+        const speedBuf = Buffer.alloc(2); speedBuf.writeUInt16BE(this.speed);
+        const dirBuf = Buffer.alloc(2); dirBuf.writeUInt16BE(Math.round(this.direction));
+        
+        const time = new Date();
+        const timeStr = 
+            time.getFullYear().toString().slice(2) + 
+            (time.getMonth()+1).toString().padStart(2,'0') + 
+            time.getDate().toString().padStart(2,'0') +
+            time.getHours().toString().padStart(2,'0') +
+            time.getMinutes().toString().padStart(2,'0') +
+            time.getSeconds().toString().padStart(2,'0');
+        const timeBcd = intToBcd(timeStr, 6);
+
+        const body = Buffer.concat([alarm, status, lat, lng, altitude, speedBuf, dirBuf, timeBcd]);
+        this.sendPacket(MSG_ID.LOCATION, body);
+    }
+
+    handleData(data) {
+        const packet = unescapeBuffer(data);
+        
+        // Registration Response
+        if (packet[1] === 0x81 && packet[2] === 0x00) {
+            const result = packet[14];
+            if (result === 0) {
+                this.authCode = packet.slice(15, packet.length - 2).toString();
+                this.sendAuth();
+            } else {
+                console.log(`[${this.index}] Registration Failed (Code ${result})`);
+                this.disconnect();
+            }
+        }
+        // Auth Response
+        else if (packet[1] === 0x80 && packet[2] === 0x01) {
+            const respToMsgId = packet.readUInt16BE(13);
+            if (respToMsgId === MSG_ID.AUTH) {
+                this.status = 'STREAMING';
+                this.startStreaming();
+            }
+        }
+    }
+}
+
+// ==========================================
+// MAIN CLI
+// ==========================================
+
+const devices = [];
+
+// Initialize Devices
+for (let i = 1; i <= CONFIG.NUM_DEVICES; i++) {
+    devices.push(new VirtualDevice(i));
+}
+
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+});
+
+console.log("\n==============================================");
+console.log("   GPS SIMULATOR - JT/T 808 PROTOCOL");
+console.log("==============================================");
+console.log(`Target Server: ${CONFIG.HOST}:${CONFIG.PORT}`);
+console.log(`Devices Ready: ${CONFIG.NUM_DEVICES} (Virtual Cars)`);
+console.log("----------------------------------------------");
+console.log("Commands:");
+console.log("  start all      - Start 20 devices");
+console.log("  start <id>     - Start specific device (1-20)");
+console.log("  stop all       - Stop all");
+console.log("  status         - Show Speed & IMEI");
+console.log("  exit           - Quit");
+console.log("==============================================\n");
+
+function processCommand(cmd) {
+    const parts = cmd.trim().toLowerCase().split(' ');
+    const action = parts[0];
+    const target = parts[1];
+
+    if (action === 'start') {
+        if (target === 'all') {
+            console.log("Starting all devices...");
+            let delay = 0;
+            devices.forEach(d => {
+                setTimeout(() => d.connect(), delay);
+                delay += 100; // Stagger 100ms to avoid flooding
+            });
+        } else if (target) {
+            const idx = parseInt(target);
+            if (devices[idx-1]) devices[idx-1].connect();
+            else console.log("Invalid ID. Use 1-20.");
+        }
+    } 
+    else if (action === 'stop') {
+        if (target === 'all') {
+            devices.forEach(d => d.disconnect());
+        } else if (target) {
+            const idx = parseInt(target);
+            if (devices[idx-1]) devices[idx-1].disconnect();
+        }
+    }
+    else if (action === 'status') {
+        console.log("\n--- Device Dashboard ---");
+        devices.forEach((d, i) => {
+            const info = d.status === 'STREAMING' 
+                ? `Speed: ${d.speed}km/h | Heading: ${Math.round(d.direction)}°` 
+                : d.status;
+            console.log(`[${i+1}] ${d.imei} | ${info}`);
+        });
+        console.log("------------------------\n");
+    }
+    else if (action === 'exit') {
+        devices.forEach(d => d.disconnect());
+        process.exit(0);
+    }
+
+    rl.question('', processCommand);
+}
+
+rl.question('', processCommand);

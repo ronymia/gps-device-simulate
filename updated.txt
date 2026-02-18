@@ -1,0 +1,391 @@
+
+javascript
+const net = require('net');
+const readline = require('readline');
+const https = require('https'); // Required for fetching Road Routes
+
+// ==========================================
+// CONFIGURATION
+// ==========================================
+
+const CONFIG = {
+    HOST: '54.37.225.166', 
+    PORT: 3017,            
+    NUM_DEVICES: 20,
+    
+    // Map Center (London)
+    CENTER_LAT: 51.5074,
+    CENTER_LNG: -0.1278,
+    
+    // How far away to pick destinations (km)
+    TRIP_DISTANCE_KM: 5, 
+    
+    GPS_INTERVAL_MS: 2000
+};
+
+// ==========================================
+// PROTOCOL CONSTANTS (JT/T 808)
+// ==========================================
+const MSG_ID = {
+    REGISTER: 0x0100, AUTH: 0x0102, HEARTBEAT: 0x0002, LOCATION: 0x0200
+};
+
+// ==========================================
+// UTILITY FUNCTIONS
+// ==========================================
+
+function intToBcd(num, len) {
+    const bcd = Buffer.alloc(len);
+    const str = num.toString().padStart(len * 2, '0');
+    for (let i = 0; i < len; i++) bcd[i] = parseInt(str.substr(i * 2, 2), 16);
+    return bcd;
+}
+
+function calculateChecksum(buf) {
+    let cs = 0;
+    for (let i = 0; i < buf.length; i++) cs ^= buf[i];
+    return cs;
+}
+
+function escapeBuffer(buf) {
+    let escaped = [];
+    for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0x7E) escaped.push(0x7D, 0x02);
+        else if (buf[i] === 0x7D) escaped.push(0x7D, 0x01);
+        else escaped.push(buf[i]);
+    }
+    return Buffer.from(escaped);
+}
+
+function unescapeBuffer(buf) {
+    let unescaped = [];
+    for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0x7D) {
+            i++; 
+            if (buf[i] === 0x02) unescaped.push(0x7E);
+            else if (buf[i] === 0x01) unescaped.push(0x7D);
+        } else unescaped.push(buf[i]);
+    }
+    return Buffer.from(unescaped);
+}
+
+function generateIMEI(index) {
+    return `868120${String(index).padStart(9, '0')}`;
+}
+
+// NEW: Helper to make HTTP requests (for OSRM)
+function httpGet(url) {
+    return new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+            let data = '';
+            res.on('data', (chunk) => data += chunk);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)); } 
+                catch (e) { reject(e); }
+            });
+        }).on('error', reject);
+    });
+}
+
+// ==========================================
+// VIRTUAL DEVICE CLASS
+// ==========================================
+class VirtualDevice {
+    constructor(index) {
+        this.index = index;
+        this.imei = generateIMEI(index); 
+        this.plateNumber = `SIM-${index.toString().padStart(4, '0')}`;
+        
+        this.serialNo = 1;
+        this.authCode = '';
+        this.socket = null;
+        this.intervals = [];
+        this.status = 'OFFLINE';
+
+        // Movement State
+        this.lat = CONFIG.CENTER_LAT;
+        this.lng = CONFIG.CENTER_LNG;
+        
+        // Road Navigation State
+        this.route = []; // Array of [lng, lat] coordinates
+        this.routeIndex = 0;
+        this.speed = 0; // Calculated dynamically
+    }
+
+    connect() {
+        if (this.socket) this.disconnect();
+
+        this.socket = new net.Socket();
+        this.status = 'CONNECTING';
+        
+        this.socket.on('data', (data) => this.handleData(data));
+        this.socket.on('close', () => { 
+            this.status = 'OFFLINE'; 
+            this.clearIntervals();
+        });
+        this.socket.on('error', () => { 
+            this.status = 'ERROR'; 
+            this.clearIntervals();
+        });
+
+        this.socket.connect(CONFIG.PORT, CONFIG.HOST, () => {
+            this.status = 'CONNECTED';
+            console.log(`[Device ${this.index}] Connected.`);
+            this.sendRegister();
+        });
+    }
+
+    disconnect() {
+        this.clearIntervals();
+        if (this.socket) {
+            this.socket.destroy();
+            this.socket = null;
+        }
+        this.status = 'OFFLINE';
+    }
+
+    clearIntervals() {
+        this.intervals.forEach(clearInterval);
+        this.intervals = [];
+    }
+
+    buildPacket(msgId, body) {
+        const phone = intToBcd(this.imei, 6);
+        const serial = Buffer.alloc(2); 
+        serial.writeUInt16BE(this.serialNo++);
+        
+        const msgProps = Buffer.alloc(2);
+        msgProps.writeUInt16BE(body.length);
+        
+        const header = Buffer.concat([
+            Buffer.from([msgId >> 8, msgId & 0xff]), 
+            msgProps, 
+            phone, 
+            serial
+        ]);
+        
+        const content = Buffer.concat([header, body]);
+        const checksum = Buffer.from([calculateChecksum(content)]);
+        const rawPacket = Buffer.concat([Buffer.from([0x7E]), content, checksum, Buffer.from([0x7E])]);
+        
+        return escapeBuffer(rawPacket);
+    }
+
+    sendPacket(msgId, body) {
+        if (!this.socket || this.socket.destroyed) return;
+        const packet = this.buildPacket(msgId, body);
+        this.socket.write(packet);
+    }
+
+    sendRegister() {
+        const body = Buffer.concat([
+            Buffer.from([0x00, 0x00]), Buffer.from([0x00, 0x00]),
+            Buffer.from('SIMULATOR'), Buffer.from('MODEL01'),
+            intToBcd(this.imei, 6), Buffer.from([0x01]),
+            Buffer.from(this.plateNumber)
+        ]);
+        this.sendPacket(MSG_ID.REGISTER, body);
+    }
+
+    sendAuth() {
+        const body = Buffer.from(this.authCode);
+        this.sendPacket(MSG_ID.AUTH, body);
+    }
+
+    async startStreaming() {
+        console.log(`[Device ${this.index}] ✅ Authenticated. Finding first route...`);
+        
+        // Heartbeat Loop
+        this.intervals.push(setInterval(() => {
+            this.sendPacket(MSG_ID.HEARTBEAT, Buffer.alloc(0));
+        }, 30000));
+
+        // GPS Loop
+        this.intervals.push(setInterval(() => {
+            this.updatePosition();
+            this.sendLocation();
+        }, CONFIG.GPS_INTERVAL_MS));
+
+        // Get First Route
+        await this.fetchNewRoute();
+    }
+
+    // --- ROAD LOGIC ---
+
+    // 1. Fetch a real road route from OSRM (Free Open Source Routing)
+    async fetchNewRoute() {
+        try {
+            // Pick random start and end points roughly 5km away
+            const rLat = CONFIG.CENTER_LAT + ((Math.random() - 0.5) * 0.1);
+            const rLng = CONFIG.CENTER_LNG + ((Math.random() - 0.5) * 0.1);
+            
+            // Use current position as start if available, else random
+            const startLng = this.route.length > 0 ? this.lng : rLng;
+            const startLat = this.route.length > 0 ? this.lat : rLat;
+
+            const endLat = startLat + ((Math.random() - 0.5) * 0.05); // Small random trip
+            const endLng = startLng + ((Math.random() - 0.5) * 0.05);
+
+            // OSRM API: driving car
+            const url = `https://router.project-osrm.org/route/v1/driving/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson`;
+
+            const data = await httpGet(url);
+            
+            if (data.code === 'Ok' && data.routes && data.routes.length > 0) {
+                this.route = data.routes[0].geometry.coordinates; // Array of [lng, lat]
+                this.routeIndex = 0;
+                this.speed = Math.floor(Math.random() * 30) + 20; // Random 20-50km/h
+                console.log(`[Device ${this.index}] New route found (${this.route.length} points). Speed: ${this.speed}km/h`);
+            } else {
+                console.log(`[Device ${this.index}] Failed to find route. Retrying...`);
+            }
+
+        } catch (error) {
+            console.log(`[Device ${this.index}] Routing API Error.`);
+        }
+    }
+
+    updatePosition() {
+        if (this.route.length === 0) return;
+
+        // Get Target Point (OSRM format is [lng, lat])
+        if (this.routeIndex >= this.route.length) {
+            // Route finished, get a new one
+            this.fetchNewRoute();
+            return;
+        }
+
+        const target = this.route[this.routeIndex];
+        const targetLng = target[0];
+        const targetLat = target[1];
+
+        // Calculate distance to target (simple euclidean for small distances)
+        const distLat = targetLat - this.lat;
+        const distLng = targetLng - this.lng;
+
+        // If we are very close to the point, snap to it and move index forward
+        if (Math.abs(distLat) < 0.0001 && Math.abs(distLng) < 0.0001) {
+            this.routeIndex++;
+            return;
+        }
+
+        // Move towards the point
+        // Logic: move a fraction of the distance based on speed
+        // For simulation, we just interpolate smoothly.
+        // Smoothing factor (lower = slower turning)
+        const step = 0.2; // Jump 20% of the remaining distance per tick
+        
+        this.lat += distLat * step;
+        this.lng += distLng * step;
+
+        // Calculate Heading
+        this.direction = Math.atan2(distLng, distLat) * 180 / Math.PI;
+        if (this.direction < 0) this.direction += 360;
+    }
+
+    sendLocation() {
+        const alarm = Buffer.alloc(4);
+        const status = Buffer.alloc(4); status.writeUInt32BE(0x00000001);
+        
+        const lat = Buffer.alloc(4); lat.writeInt32BE(Math.round(this.lat * 1000000));
+        const lng = Buffer.alloc(4); lng.writeInt32BE(Math.round(this.lng * 1000000));
+        
+        const altitude = Buffer.from([0x00, 0x32]); 
+        const speedBuf = Buffer.alloc(2); speedBuf.writeUInt16BE(this.speed);
+        const dirBuf = Buffer.alloc(2); dirBuf.writeUInt16BE(Math.round(this.direction));
+        
+        const time = new Date();
+        const timeStr = 
+            time.getFullYear().toString().slice(2) + 
+            (time.getMonth()+1).toString().padStart(2,'0') + 
+            time.getDate().toString().padStart(2,'0') +
+            time.getHours().toString().padStart(2,'0') +
+            time.getMinutes().toString().padStart(2,'0') +
+            time.getSeconds().toString().padStart(2,'0');
+        const timeBcd = intToBcd(timeStr, 6);
+
+        const body = Buffer.concat([alarm, status, lat, lng, altitude, speedBuf, dirBuf, timeBcd]);
+        this.sendPacket(MSG_ID.LOCATION, body);
+    }
+
+    handleData(data) {
+        const packet = unescapeBuffer(data);
+        
+        if (packet[1] === 0x81 && packet[2] === 0x00) {
+            const result = packet[14];
+            if (result === 0) {
+                this.authCode = packet.slice(15, packet.length - 2).toString();
+                this.sendAuth();
+            } else this.disconnect();
+        }
+        else if (packet[1] === 0x80 && packet[2] === 0x01) {
+            const respToMsgId = packet.readUInt16BE(13);
+            if (respToMsgId === MSG_ID.AUTH) {
+                this.status = 'STREAMING';
+                this.startStreaming();
+            }
+        }
+    }
+}
+
+// ==========================================
+// MAIN CLI
+// ==========================================
+
+const devices = [];
+for (let i = 1; i <= CONFIG.NUM_DEVICES; i++) devices.push(new VirtualDevice(i));
+
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+console.log("\n==============================================");
+console.log("   ROAD-LOCKED GPS SIMULATOR (JT/T 808)");
+console.log("==============================================");
+console.log(`Server: ${CONFIG.HOST}:${CONFIG.PORT}`);
+console.log(`Mode  : Roads Only (OSRM Routing)`);
+console.log("----------------------------------------------");
+console.log("Commands: start all | start <id> | stop all | status | exit");
+console.log("==============================================\n");
+
+function processCommand(cmd) {
+    const parts = cmd.trim().toLowerCase().split(' ');
+    const action = parts[0];
+    const target = parts[1];
+
+    if (action === 'start') {
+        if (target === 'all') {
+            console.log("Starting all devices (Staggered 1 sec apart)...");
+            let delay = 0;
+            devices.forEach(d => {
+                setTimeout(() => d.connect(), delay);
+                delay += 1000; // 1 second delay to respect routing API limits
+            });
+        } else if (target) {
+            const idx = parseInt(target);
+            if (devices[idx-1]) devices[idx-1].connect();
+        }
+    } 
+    else if (action === 'stop') {
+        if (target === 'all') devices.forEach(d => d.disconnect());
+        else if (target) {
+            const idx = parseInt(target);
+            if (devices[idx-1]) devices[idx-1].disconnect();
+        }
+    }
+    else if (action === 'status') {
+        console.log("\n--- Device Dashboard ---");
+        devices.forEach((d, i) => {
+            const info = d.status === 'STREAMING' 
+                ? `Speed: ${d.speed}km/h | Route Points Left: ${d.route.length - d.routeIndex}` 
+                : d.status;
+            console.log(`[${i+1}] ${d.imei} | ${info}`);
+        });
+        console.log("------------------------\n");
+    }
+    else if (action === 'exit') {
+        devices.forEach(d => d.disconnect());
+        process.exit(0);
+    }
+    rl.question('', processCommand);
+}
+
+rl.question('', processCommand);
