@@ -1,25 +1,24 @@
 const net = require("net");
 const readline = require("readline");
+const https = require("https"); // Required for fetching Road Routes
 
 // ==========================================
 // CONFIGURATION
 // ==========================================
 
 const CONFIG = {
-  // 1. SERVER DETAILS (Your ai-dashcam-server backend)
+  // 1. SERVER DETAILS
   HOST: "54.37.225.65",
   PORT: 4017,
-  // HOST: "0.0.0.0",
-  // PORT: 3017,
 
   // 2. SIMULATION SETTINGS
-  NUM_DEVICES: 5, // Total number of virtual cars
-  CENTER_LAT: 51.5074, // Start Location: London, UK
+  NUM_DEVICES: 1, // Total number of virtual cars
+  CENTER_LAT: 51.5074, // Center of simulation (London, UK)
   CENTER_LNG: -0.1278,
-  SPREAD: 0.1, // How far cars spawn from center (~10km radius)
+  TRIP_DISTANCE_KM: 5, // Average trip distance
 
   // 3. TIMING
-  GPS_INTERVAL_MS: 1000 * 10, // Send GPS every 10 seconds
+  GPS_INTERVAL_MS: 1000 * 10, // Send GPS every 2 seconds
 };
 
 // ==========================================
@@ -84,6 +83,25 @@ function generateIMEI(index) {
   return `868120${String(index).padStart(9, "0")}`;
 }
 
+// Helper to make HTTP requests (for OSRM)
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      })
+      .on("error", reject);
+  });
+}
+
 // ==========================================
 // VIRTUAL DEVICE CLASS
 // ==========================================
@@ -102,16 +120,15 @@ class VirtualDevice {
     this.intervals = [];
     this.status = "OFFLINE";
 
-    // Movement
-    // Random spawn within SPREAD degrees of center
-    this.lat = CONFIG.CENTER_LAT + (Math.random() - 0.5) * 2 * CONFIG.SPREAD;
-    this.lng = CONFIG.CENTER_LNG + (Math.random() - 0.5) * 2 * CONFIG.SPREAD;
+    // Movement State
+    this.lat = CONFIG.CENTER_LAT;
+    this.lng = CONFIG.CENTER_LNG;
 
-    // Random speed: between 10 and 70 km/h
-    this.speed = Math.floor(Math.random() * 60) + 10;
-
-    // Random direction: 0-360 degrees
-    this.direction = Math.floor(Math.random() * 360);
+    // Road Navigation State
+    this.route = []; // Array of [lng, lat] coordinates
+    this.routeIndex = 0;
+    this.speed = 0; // Calculated dynamically per route
+    this.direction = 0;
   }
 
   connect() {
@@ -133,9 +150,7 @@ class VirtualDevice {
 
     this.socket.connect(CONFIG.PORT, CONFIG.HOST, () => {
       this.status = "CONNECTED";
-      console.log(
-        `[Device ${this.index}] Connected to ${CONFIG.HOST}. Registering...`,
-      );
+      console.log(`[Device ${this.index}] Connected.`);
       this.sendRegister();
     });
   }
@@ -193,6 +208,7 @@ class VirtualDevice {
   }
 
   sendRegister() {
+    // Proper JT/T 808 registration body
     const manufacturer = Buffer.alloc(5);
     Buffer.from("SIMUL").copy(manufacturer);
 
@@ -219,10 +235,9 @@ class VirtualDevice {
     this.sendPacket(MSG_ID.AUTH, body);
   }
 
-  startStreaming() {
-    this.status = "STREAMING";
+  async startStreaming() {
     console.log(
-      `[Device ${this.index}] ✅ Authenticated! Driving at ${this.speed}km/h heading ${Math.round(this.direction)}°`,
+      `[Device ${this.index}] ✅ Authenticated. Finding first route...`,
     );
 
     // Heartbeat every 30 seconds
@@ -232,71 +247,143 @@ class VirtualDevice {
       }, 30000),
     );
 
-    // GPS Location every GPS_INTERVAL_MS
+    // GPS Loop every GPS_INTERVAL_MS
     this.intervals.push(
       setInterval(() => {
         this.updatePosition();
         this.sendLocation();
       }, CONFIG.GPS_INTERVAL_MS),
     );
+
+    // Get First Route
+    await this.fetchNewRoute();
+  }
+
+  // --- ROAD LOGIC ---
+
+  // Fetch a real road route from OSRM (Free Open Source Routing)
+  async fetchNewRoute() {
+    try {
+      // Pick random start and end points roughly within London area
+      const rLat = CONFIG.CENTER_LAT + (Math.random() - 0.5) * 0.1;
+      const rLng = CONFIG.CENTER_LNG + (Math.random() - 0.5) * 0.1;
+
+      // Use current position as start if available, else random
+      const startLng = this.route.length > 0 ? this.lng : rLng;
+      const startLat = this.route.length > 0 ? this.lat : rLat;
+
+      const endLat = startLat + (Math.random() - 0.5) * 0.05; // Small random trip
+      const endLng = startLng + (Math.random() - 0.5) * 0.05;
+
+      // OSRM API: driving car
+      const url = `https://router.project-osrm.org/route/v1/driving/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson`;
+
+      const data = await httpGet(url);
+
+      if (data.code === "Ok" && data.routes && data.routes.length > 0) {
+        this.route = data.routes[0].geometry.coordinates; // Array of [lng, lat]
+        this.routeIndex = 0;
+        this.speed = Math.floor(Math.random() * 30) + 20; // Random 20-50km/h
+
+        // Snap device position to the first road-snapped waypoint of the new route.
+        // Without this, the device walks in a straight line (across parks/buildings)
+        // from its old position to the first road point.
+        this.lng = this.route[0][0];
+        this.lat = this.route[0][1];
+
+        console.log(
+          `[Device ${this.index}] New route found (${this.route.length} points). Speed: ${this.speed}km/h | Start: ${this.lat.toFixed(6)},${this.lng.toFixed(6)}`,
+        );
+      } else {
+        console.log(
+          `[Device ${this.index}] Failed to find route. Retrying in 5s...`,
+        );
+        setTimeout(() => this.fetchNewRoute(), 5000);
+      }
+    } catch (error) {
+      console.log(`[Device ${this.index}] Routing API Error: ${error.message}`);
+      setTimeout(() => this.fetchNewRoute(), 5000);
+    }
   }
 
   updatePosition() {
-    // Add slight random turn to simulate road driving
-    this.direction += Math.random() * 6 - 3;
-    if (this.direction < 0) this.direction += 360;
-    if (this.direction > 360) this.direction -= 360;
+    if (this.route.length === 0) return;
 
-    // Calculate movement based on speed
-    // Speed is km/h, time step is CONFIG.GPS_INTERVAL_MS
-    // const kmPerMs = this.speed / 3600000;
-    // const distKm = kmPerMs * CONFIG.GPS_INTERVAL_MS;
-    // const distDeg = distKm / 111.0; // 1 deg ≈ 111km
+    if (this.routeIndex >= this.route.length) {
+      // Route finished, get a new one
+      this.fetchNewRoute();
+      return;
+    }
 
-    // const rad = (this.direction * Math.PI) / 180;
+    // Calculate how far the vehicle should travel this tick based on real speed
+    // speed is in km/h, GPS_INTERVAL_MS is in ms
+    const tickSeconds = CONFIG.GPS_INTERVAL_MS / 1000;
+    let remainingKm = (this.speed / 3600) * tickSeconds;
 
-    // this.lat += Math.cos(rad) * distDeg;
-    // this.lng += Math.sin(rad) * distDeg;
-    const kmPerSec = this.speed / 3600;
-    const distKm = kmPerSec * (CONFIG.GPS_INTERVAL_MS / 1000);
+    // Walk through route waypoints, consuming distance until this tick's budget is spent
+    while (remainingKm > 0 && this.routeIndex < this.route.length) {
+      const target = this.route[this.routeIndex];
+      const targetLng = target[0];
+      const targetLat = target[1];
 
-    const rad = (this.direction * Math.PI) / 180;
-    const latDegPerKm = 1 / 111.32;
-    const lngDegPerKm = 1 / (111.32 * Math.cos((this.lat * Math.PI) / 180));
+      const distLat = targetLat - this.lat;
+      const distLng = targetLng - this.lng;
 
-    this.lat += distKm * Math.cos(rad) * latDegPerKm;
-    this.lng += distKm * Math.sin(rad) * lngDegPerKm;
+      // Convert lat/lng delta to approximate km using Haversine approximation
+      const dLatKm = distLat * 111.32;
+      const dLngKm = distLng * 111.32 * Math.cos((this.lat * Math.PI) / 180);
+      const segmentKm = Math.sqrt(dLatKm * dLatKm + dLngKm * dLngKm);
+
+      // Calculate heading toward this waypoint
+      this.direction = (Math.atan2(distLng, distLat) * 180) / Math.PI;
+      if (this.direction < 0) this.direction += 360;
+
+      if (segmentKm <= remainingKm) {
+        // Snap exactly to the waypoint and advance to the next
+        this.lat = targetLat;
+        this.lng = targetLng;
+        remainingKm -= segmentKm;
+        this.routeIndex++;
+      } else {
+        // Move partially along the segment proportional to remaining distance budget
+        const fraction = remainingKm / segmentKm;
+        this.lat += distLat * fraction;
+        this.lng += distLng * fraction;
+        remainingKm = 0;
+      }
+    }
   }
 
   sendLocation() {
     const alarm = Buffer.alloc(4);
     const status = Buffer.alloc(4);
-    let statusBits = 0b00000000000000000000000000000011; // Base: bit0=ACC ON, bit1=positioned
+
+    // Base status: bit0=ACC ON, bit1=Positioned
+    let statusBits = 0b11;
     let latValue = this.lat;
     let lngValue = this.lng;
 
+    // bit2: 0=North, 1=South
     if (latValue < 0) {
-      statusBits |= 1 << 2; // bit2=1 south latitude
+      statusBits |= 1 << 2;
       latValue = Math.abs(latValue);
-    } // else bit2=0 north (London)
-
+    }
+    // bit3: 0=East, 1=West
     if (lngValue < 0) {
-      statusBits |= 1 << 3; // bit3=1 west longitude
+      statusBits |= 1 << 3;
       lngValue = Math.abs(lngValue);
-    } // else bit3=0 east
+    }
 
     status.writeUInt32BE(statusBits);
 
-    const lat = Buffer.alloc(4);
-    lat.writeUInt32BE(Math.round(latValue * 1000000));
-
-    const lng = Buffer.alloc(4);
-    lng.writeUInt32BE(Math.round(lngValue * 1000000));
+    const latBuf = Buffer.alloc(4);
+    latBuf.writeUInt32BE(Math.round(latValue * 1000000));
+    const lngBuf = Buffer.alloc(4);
+    lngBuf.writeUInt32BE(Math.round(lngValue * 1000000));
 
     const altitude = Buffer.from([0x00, 0x32]);
     const speedBuf = Buffer.alloc(2);
     speedBuf.writeUInt16BE(this.speed);
-
     const dirBuf = Buffer.alloc(2);
     dirBuf.writeUInt16BE(Math.round(this.direction));
 
@@ -313,8 +400,8 @@ class VirtualDevice {
     const body = Buffer.concat([
       alarm,
       status,
-      lat,
-      lng,
+      latBuf,
+      lngBuf,
       altitude,
       speedBuf,
       dirBuf,
@@ -324,54 +411,42 @@ class VirtualDevice {
   }
 
   handleData(data) {
-    // Strip leading/trailing 0x7E markers
+    // Strip 0x7E framing markers
     let raw = data;
     if (raw[0] === 0x7e) raw = raw.slice(1);
     if (raw[raw.length - 1] === 0x7e) raw = raw.slice(0, -1);
 
     const packet = unescapeBuffer(raw);
-
     if (packet.length < 12) return;
 
     const msgId = packet.readUInt16BE(0);
 
-    // Registration Response (0x8100)
+    // Registration Response
     if (msgId === 0x8100) {
-      const bodyStart = 12; // After 2(msgId) + 2(props) + 6(phone) + 2(serial)
-      const respSerial = packet.readUInt16BE(bodyStart);
+      const bodyStart = 12;
       const result = packet[bodyStart + 2];
-
       if (result === 0) {
-        // Extract auth code from body (after serial + result byte)
+        // Auth code is after serial(2) and result(1)
         this.authCode = packet
           .slice(bodyStart + 3, packet.length - 1)
           .toString();
-        console.log(
-          `[Device ${this.index}] Registered OK. Auth code: "${this.authCode}". Authenticating...`,
-        );
         this.sendAuth();
       } else {
-        console.log(
-          `[Device ${this.index}] Registration Failed (Code ${result})`,
-        );
+        console.log(`[${this.index}] Registration Failed (Code ${result})`);
         this.disconnect();
       }
     }
-    // General Response (0x8001)
+    // General Response
     else if (msgId === 0x8001) {
       const bodyStart = 12;
-      const respSerial = packet.readUInt16BE(bodyStart);
       const respToMsgId = packet.readUInt16BE(bodyStart + 2);
       const result = packet[bodyStart + 4];
-
       if (respToMsgId === MSG_ID.AUTH) {
         if (result === 0) {
-          console.log(`[Device ${this.index}] Auth accepted by server.`);
+          this.status = "STREAMING";
           this.startStreaming();
         } else {
-          console.log(
-            `[Device ${this.index}] Auth rejected (result=${result})`,
-          );
+          console.log(`[${this.index}] Auth rejected (result=${result})`);
           this.disconnect();
         }
       }
@@ -384,8 +459,6 @@ class VirtualDevice {
 // ==========================================
 
 const devices = [];
-
-// Initialize Devices
 for (let i = 1; i <= CONFIG.NUM_DEVICES; i++) {
   devices.push(new VirtualDevice(i));
 }
@@ -396,18 +469,13 @@ const rl = readline.createInterface({
 });
 
 console.log("\n==============================================");
-console.log("   GPS SIMULATOR - JT/T 808 PROTOCOL");
+console.log("   ROAD-LOCKED GPS SIMULATOR (JT/T 808)");
 console.log("==============================================");
 console.log(`Target Server: ${CONFIG.HOST}:${CONFIG.PORT}`);
 console.log(`Devices Ready: ${CONFIG.NUM_DEVICES} (Virtual Cars)`);
+console.log(`Mode  : Roads Only (OSRM Routing)`);
 console.log("----------------------------------------------");
-console.log("Commands:");
-console.log("  start all      - Start all 20 devices");
-console.log("  start <id>     - Start specific device (1-20)");
-console.log("  stop all       - Stop all devices");
-console.log("  stop <id>      - Stop specific device");
-console.log("  status         - Show device dashboard");
-console.log("  exit           - Quit");
+console.log("Commands: start all | start <id> | stop all | status | exit");
 console.log("==============================================\n");
 
 function processCommand(cmd) {
@@ -417,53 +485,37 @@ function processCommand(cmd) {
 
   if (action === "start") {
     if (target === "all") {
-      console.log("Starting all devices...");
+      console.log("Starting all devices (Staggered 1s for API)...");
       let delay = 0;
       devices.forEach((d) => {
         setTimeout(() => d.connect(), delay);
-        delay += 100; // Stagger 100ms to avoid flooding
+        delay += 1000; // Staggered start to respect routing API
       });
     } else if (target) {
       const idx = parseInt(target);
-      if (idx >= 1 && idx <= CONFIG.NUM_DEVICES && devices[idx - 1]) {
-        devices[idx - 1].connect();
-      } else {
-        console.log(`Invalid ID. Use 1-${CONFIG.NUM_DEVICES}.`);
-      }
+      if (devices[idx - 1]) devices[idx - 1].connect();
     }
   } else if (action === "stop") {
     if (target === "all") {
       devices.forEach((d) => d.disconnect());
     } else if (target) {
       const idx = parseInt(target);
-      if (idx >= 1 && idx <= CONFIG.NUM_DEVICES && devices[idx - 1]) {
-        devices[idx - 1].disconnect();
-      } else {
-        console.log(`Invalid ID. Use 1-${CONFIG.NUM_DEVICES}.`);
-      }
+      if (devices[idx - 1]) devices[idx - 1].disconnect();
     }
   } else if (action === "status") {
     console.log("\n--- Device Dashboard ---");
     devices.forEach((d, i) => {
       const info =
         d.status === "STREAMING"
-          ? `Speed: ${d.speed}km/h | Heading: ${Math.round(d.direction)}° | Lat: ${d.lat.toFixed(6)} Lng: ${d.lng.toFixed(6)}`
+          ? `Speed: ${d.speed}km/h | Route Points Left: ${d.route.length - d.routeIndex} | Lat: ${d.lat.toFixed(6)} Lng: ${d.lng.toFixed(6)}`
           : d.status;
-      console.log(
-        `  [${String(i + 1).padStart(2)}] ${d.imei} | ${d.plateNumber} | ${info}`,
-      );
+      console.log(`[${i + 1}] ${d.imei} | ${info}`);
     });
     console.log("------------------------\n");
   } else if (action === "exit") {
-    console.log("Shutting down all devices...");
     devices.forEach((d) => d.disconnect());
     process.exit(0);
-  } else if (action) {
-    console.log(
-      `Unknown command: "${action}". Type: start all | stop all | status | exit`,
-    );
   }
-
   rl.question("> ", processCommand);
 }
 
