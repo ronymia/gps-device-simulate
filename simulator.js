@@ -8,11 +8,11 @@ const https = require("https"); // Required for fetching Road Routes
 
 const CONFIG = {
   // 1. SERVER DETAILS
-  HOST: "54.37.225.65",
+  HOST: "127.0.0.1",
   PORT: 4017,
 
   // 2. SIMULATION SETTINGS
-  NUM_DEVICES: 1, // Total number of virtual cars
+  NUM_DEVICES: 10, // Total number of virtual cars
   CENTER_LAT: 51.5074, // Center of simulation (London, UK)
   CENTER_LNG: -0.1278,
   TRIP_DISTANCE_KM: 5, // Average trip distance
@@ -78,9 +78,9 @@ function unescapeBuffer(buf) {
   return Buffer.from(unescaped);
 }
 
-// Generate a 15-digit IMEI based on index
+// Generate a 12-digit device ID based on index
 function generateIMEI(index) {
-  return `868120${String(index).padStart(9, "0")}`;
+  return `868120${String(index).padStart(6, "0")}`;
 }
 
 // Helper to make HTTP requests (for OSRM)
@@ -216,7 +216,7 @@ class VirtualDevice {
     Buffer.from("MODEL01").copy(model);
 
     const terminalId = Buffer.alloc(7);
-    Buffer.from(this.imei.slice(0, 7)).copy(terminalId);
+    Buffer.from(this.imei.slice(-7)).copy(terminalId);
 
     const body = Buffer.concat([
       Buffer.from([0x00, 0x00]), // Province ID
