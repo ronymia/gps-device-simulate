@@ -8,6 +8,7 @@ const https = require("https"); // Required for fetching Road Routes
 
 const CONFIG = {
   // 1. SERVER DETAILS
+  // HOST: "54.37.225.65",
   HOST: "127.0.0.1",
   PORT: 4017,
 
